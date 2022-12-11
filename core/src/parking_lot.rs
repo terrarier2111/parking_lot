@@ -1092,6 +1092,79 @@ pub unsafe fn unpark_filter(
     result
 }
 
+// FIXME: add doc-comment!
+#[inline]
+pub unsafe fn unpark_single(
+    key: usize,
+    mut filter: impl FnMut(ParkToken) -> bool,
+    callback: impl FnOnce(UnparkResult) -> UnparkToken,
+) -> UnparkResult {
+    // Lock the bucket for the given key
+    let bucket = lock_bucket(key);
+
+    // Go through the queue looking for threads with a matching key
+    let mut link = &bucket.queue_head;
+    let mut current = bucket.queue_head.get();
+    let mut previous = ptr::null();
+    let mut thread = ptr::null();
+    let mut result = UnparkResult::default();
+    let mut stop = false;
+    while !current.is_null() {
+        if (*current).key.load(Ordering::Relaxed) == key {
+            if stop {
+                result.have_more_threads = true;
+                break;
+            }
+            // Call the filter function with the thread's ParkToken
+            let next = (*current).next_in_queue.get();
+            if filter((*current).park_token.get()) {
+                // Remove the thread from the queue
+                link.set(next);
+                if bucket.queue_tail.get() == current {
+                    bucket.queue_tail.set(previous);
+                }
+
+                // Add the thread to our list of threads to unpark
+                thread = current;
+
+                current = next;
+
+                stop = true;
+            }
+        } else {
+            link = &(*current).next_in_queue;
+            previous = current;
+            current = link.get();
+        }
+    }
+
+    // Invoke the callback before waking up the threads
+    if !thread.is_null() {
+        result.unparked_threads = 1;
+        result.be_fair = (*bucket.fair_timeout.get()).should_timeout();
+    }
+    let token = callback(result);
+
+    // Pass the token to all threads that are going to be unparked and prepare
+    // them for unparking.
+    let mut thread_handle = None;
+    if !thread.is_null() {
+        (*thread).unpark_token.set(token);
+        thread_handle = Some((*thread).parker.unpark_lock());
+    }
+
+    // SAFETY: We hold the lock here, as required
+    bucket.mutex.unlock();
+
+    // Now that we are outside the lock, wake up all the threads that we removed
+    // from the queue.
+    if let Some(handle) = thread_handle {
+        handle.unpark();
+    }
+
+    result
+}
+
 /// \[Experimental\] Deadlock detection
 ///
 /// Enabled via the `deadlock_detection` feature flag.
